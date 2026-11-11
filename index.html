@@ -1,5 +1,5 @@
 <!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Fútbol de Primera — Descargar</title><link rel="icon" href="icono.png">
+<title>Juegos de Tobías — Fútbol de Primera y ¡A Dirección!</title><link rel="icon" href="icono.png">
 <style>
 *{box-sizing:border-box}body{margin:0;background:#080b10;color:#f4f1e8;font:17px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
 header{min-height:78vh;display:flex;flex-direction:column;justify-content:flex-end;padding:6vh 6vw;background:linear-gradient(90deg,rgba(8,11,16,.92),rgba(8,11,16,.35) 60%,rgba(8,11,16,0)),linear-gradient(0deg,#080b10,rgba(8,11,16,0) 45%),url(portada.jpg) center/cover}
@@ -15,10 +15,20 @@ ol{padding-left:22px}li{margin:6px 0}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
 .card{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.12);border-radius:10px;padding:14px 16px}
 .card b{color:#ffc23a}small{color:#9aa3ad}
+.cnt{display:inline-flex;align-self:flex-start;align-items:center;gap:8px;margin:0 0 18px;padding:7px 14px;border-radius:999px;background:rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.2);font-weight:700;font-size:15px}
+.cnt i{width:9px;height:9px;border-radius:50%;background:#43d17a;box-shadow:0 0 0 0 rgba(67,209,122,.7);animation:pl 1.8s infinite}
+.cnt b{font-size:20px;color:#fff;font-variant-numeric:tabular-nums;transition:color .3s}.cnt b.up{color:#43d17a}
+@keyframes pl{70%{box-shadow:0 0 0 9px rgba(67,209,122,0)}100%{box-shadow:0 0 0 0 rgba(67,209,122,0)}}
+.otro{display:grid;grid-template-columns:minmax(0,1.1fr) minmax(0,1fr);gap:22px;align-items:center;background:#f4f0e4;color:#1c2531;border-radius:14px;padding:22px;margin-top:14px}
+.otro img{width:100%;border-radius:8px;display:block;box-shadow:0 6px 20px rgba(0,0,0,.25)}
+.otro h3{font:900 34px/1 "Arial Black",sans-serif;color:#c42f27;margin:0 0 8px}.otro p{margin:0 0 14px}
+.otro a.btn{background:#c42f27;color:#fff}.otro .cnt{background:#fff;border-color:#d8d2c0;color:#1c2531}.otro .cnt b{color:#1c2531}
+@media(max-width:700px){.otro{grid-template-columns:1fr}}
 </style></head><body>
 <header>
   <div class="k">Fútbol en primera persona · gratis</div>
   <h1>FÚTBOL <b>DE PRIMERA</b></h1>
+  <div class="cnt"><i></i><b data-k="gagliarditobi_futboldeprimera_instalaciones">…</b> descargas</div>
   <p class="lead">Empezá en el potrero, debutá en la B y llegá a Europa y al Mundial. Se juega en compu o celular y anda sin internet una vez instalado.</p>
   <div class="btns"><a class="btn" href="primera08/">▶ Jugar e instalar</a><a class="btn sec" href="#como">¿Cómo se instala?</a></div>
 </header>
@@ -38,5 +48,20 @@ ol{padding-left:22px}li{margin:6px 0}
     <div class="card"><b>Estadios</b><br>Cada club con su cancha, hinchada que canta y pasto en 3D.</div>
     <div class="card"><b>Fuera de la cancha</b><br>Prensa, celular con redes, galería de goles y tienda de ropa.</div>
   </div>
-  <p style="margin-top:34px"><small>Clubes, marcas y jugadores inventados. Hecho por Tobías.</small></p>
-</main></body></html>
+  <h2>Otro juego: ¡A Dirección!</h2>
+  <div class="otro">
+    <img src="a-direccion/captura-1.jpg" alt="¡A Dirección!" loading="lazy">
+    <div>
+      <h3>¡A DIRECCIÓN!</h3>
+      <p>Siete días en el Colegio Emaús, siete travesuras. Hacelas todas sin que ninguna profe te vea: si te ven, te retan y empezás el día de nuevo. Es una app aparte, con su propio ícono.</p>
+      <div class="cnt"><i></i><b data-k="gagliarditobi_adireccion_instalaciones">…</b> descargas</div><br>
+      <a class="btn" href="a-direccion/">▶ Jugar e instalar</a>
+    </div>
+  </div>
+  <p style="margin-top:34px"><small>Clubes, marcas y jugadores inventados. Hecho por Tobías. Las descargas cuentan cada instalación como app y se actualizan solas.</small></p>
+</main><script>
+const API='https://countapi.mileshilliard.com/api/v1/get/';
+const fmt=n=>n.toLocaleString('es-AR');
+async function tick(){for(const el of document.querySelectorAll('[data-k]')){try{const r=await fetch(API+el.dataset.k,{cache:'no-store'});const v=r.status===404?0:(await r.json()).value;const old=el.dataset.v;if(old!==undefined&&+old!==v){el.classList.add('up');setTimeout(()=>el.classList.remove('up'),1500)}el.dataset.v=v;el.textContent=fmt(v)}catch(e){if(el.textContent==='…')el.textContent='—'}}}
+tick();setInterval(tick,10000);
+</script></body></html>
