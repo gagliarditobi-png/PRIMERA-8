@@ -19,5 +19,18 @@
    "type": "image/png",
    "purpose": "any maskable"
   }
+ ],
+ "description": "Fútbol en primera persona: empezá en el potrero, debutá en la B y llegá a Europa y al Mundial. Funciona sin internet.",
+ "categories": [
+  "games",
+  "sports"
+ ],
+ "screenshots": [
+  {
+   "src": "captura-1.jpg",
+   "sizes": "1280x720",
+   "type": "image/jpeg",
+   "form_factor": "wide"
+  }
  ]
 }
