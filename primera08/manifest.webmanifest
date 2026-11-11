@@ -1,6 +1,6 @@
 {
- "name": "Primera ’08",
- "short_name": "Primera 08",
+ "name": "Fútbol de Primera",
+ "short_name": "Fútbol de Primera",
  "start_url": "./index.html",
  "display": "fullscreen",
  "orientation": "landscape",
