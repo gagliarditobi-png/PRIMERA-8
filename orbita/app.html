@@ -265,6 +265,137 @@ button{cursor:pointer}
   <div class="ovbody" id="ovBody"></div>
 </div>
 
+<script>/* ia-web.js */
+/* IA y dictado para la app instalada (GitHub): reemplaza a window.claude cuando Órbita no corre adentro de Claude.
+   IA: Pollinations (gratis, sin cuenta: 1 respuesta cada ~45 s por conexión; con llave propia gratuita, sin espera).
+   Dictado: el reconocimiento de voz del navegador (Chrome, Edge, Android, Safari). */
+(function () {
+  if (window.claude && typeof window.claude.use === 'function') return;
+  const KEYS = 'orb.polkey';
+  const getKey = () => { try { return (localStorage.getItem(KEYS) || '').trim(); } catch (e) { return ''; } };
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  let chain = Promise.resolve();
+
+  function toMessages(input, opts) {
+    let msgs = typeof input === 'string' ? [{ role: 'user', content: input }] : (input || []).map(m => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: typeof m.content === 'string' ? m.content : (m.content || []).map(c => c.text || '').join('\n') }));
+    const sys = 'Respondé en el idioma del usuario (si escribe en español, en español rioplatense), claro y apto para chicos y escuelas.' + (opts && opts.system ? '\n' + opts.system : '');
+    return [{ role: 'system', content: sys }].concat(msgs);
+  }
+
+  async function call(input, opts, json) {
+    opts = opts || {};
+    const key = getKey();
+    const url = key ? 'https://gen.pollinations.ai/v1/chat/completions' : 'https://text.pollinations.ai/openai';
+    const body = { model: 'openai', messages: toMessages(input, opts) };
+    if (json) body.response_format = { type: 'json_object' };
+    const headers = { 'Content-Type': 'application/json' };
+    if (key) headers.Authorization = 'Bearer ' + key;
+    const say = t => { try { opts.onText && opts.onText({ text: t }); } catch (e) {} };
+    for (let tries = 0; tries < 4; tries++) {
+      if (opts.signal && opts.signal.aborted) throw { code: 'aborted' };
+      let r;
+      try { r = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal: opts.signal }); }
+      catch (e) { if (opts.signal && opts.signal.aborted) throw { code: 'aborted' }; await sleep(1500); continue; }
+      if (r.ok) {
+        const d = await r.json();
+        const text = (d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content || '').trim();
+        if (!text) { await sleep(1000); continue; }
+        say(text);
+        return text;
+      }
+      const tx = await r.text().catch(() => '');
+      if (r.status === 400 && body.response_format) { delete body.response_format; continue; }
+      if (r.status === 401 || r.status === 403) { if (key) throw { code: 'bad_key' }; }
+      const m = /retry after (\d+)/i.exec(tx);
+      if (r.status === 402 || r.status === 429 || m) {
+        let s = m ? +m[1] + 1 : 20;
+        if (s > 60) throw { code: 'rate_limited' };
+        for (; s > 0; s--) { if (opts.signal && opts.signal.aborted) throw { code: 'aborted' }; say('La IA gratis atiende de a uno: te toca en ' + s + ' s…'); await sleep(1000); }
+        continue;
+      }
+      await sleep(1500);
+    }
+    throw { code: 'rate_limited' };
+  }
+  const queued = fn => { const p = chain.then(fn, fn); chain = p.catch(() => {}); return p; };
+
+  function sample(input, opts) { return queued(() => call(input, opts, false)).then(text => ({ text })); }
+  sample.json = (input, opts) => queued(() => call(input, opts, true)).then(text => {
+    const a = text.indexOf('{'), b = text.lastIndexOf('}');
+    const c = text.indexOf('['), d = text.lastIndexOf(']');
+    if (a >= 0 && b > a) return JSON.parse(text.slice(a, b + 1));
+    if (c >= 0 && d > c) return JSON.parse(text.slice(c, d + 1));
+    throw { code: 'bad_json' };
+  });
+  sample.limits = async () => ({ images: false });
+  sample.web = true;
+
+  /* dictado con la voz del navegador */
+  function dictation() {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) return null;
+    const L = { f: new Set(), p: new Set(), s: new Set() };
+    const emit = (set, v) => set.forEach(cb => { try { cb(v); } catch (e) {} });
+    const on = set => cb => { set.add(cb); return () => set.delete(cb); };
+    let rec = null;
+    return {
+      onFinal: on(L.f), onPartial: on(L.p), onState: on(L.s),
+      start(o) {
+        return new Promise((res, rej) => {
+          try { if (rec) rec.abort(); } catch (e) {}
+          rec = new SR();
+          const lg = (o && o.language) || 'es-AR';
+          rec.lang = lg.length === 2 ? ({ es: 'es-AR', en: 'en-US', pt: 'pt-BR', fr: 'fr-FR', it: 'it-IT', de: 'de-DE' }[lg] || lg) : lg;
+          rec.interimResults = true; rec.continuous = false;
+          let reason = 'done';
+          rec.onstart = () => { emit(L.s, { state: 'listening' }); res(); };
+          rec.onresult = e => { let fin = '', part = ''; for (let i = e.resultIndex; i < e.results.length; i++) { const t = e.results[i][0].transcript; if (e.results[i].isFinal) fin += t; else part += t; } if (part) emit(L.p, { text: part }); if (fin) emit(L.f, { text: fin }); };
+          rec.onerror = e => { reason = e.error === 'not-allowed' || e.error === 'service-not-allowed' ? 'not_granted' : e.error === 'network' ? 'unavailable' : 'done'; if (reason === 'not_granted') rej({ code: 'not_granted' }); };
+          rec.onend = () => { emit(L.s, { state: 'idle', reason }); rec = null; };
+          try { rec.start(); } catch (e) { rej({ code: 'unavailable' }); }
+        });
+      },
+      stop() { try { rec && rec.stop(); } catch (e) {} return Promise.resolve(); }
+    };
+  }
+
+  window.claude = {
+    web: true,
+    use(name) {
+      if (name === 'sample') return Promise.resolve(sample);
+      if (name === 'dictation') return Promise.resolve(dictation());
+      return Promise.reject({ code: 'unavailable' });
+    }
+  };
+
+  /* botón para poner la llave gratuita (sin espera) */
+  function keyUI() {
+    const st = document.getElementById('iaStatus'); if (!st || document.getElementById('iaKeyB')) return;
+    const b = document.createElement('button'); b.id = 'iaKeyB'; b.type = 'button'; b.className = 'chip'; b.style.cssText = 'margin:4px 0 0;padding:3px 10px;min-height:0;font-size:13px;width:max-content';
+    const paint = () => { b.textContent = getKey() ? '🔑 Llave puesta' : '🔑 IA sin espera'; };
+    paint(); st.after(b);
+    b.onclick = () => {
+      const w = document.createElement('div');
+      w.style.cssText = 'position:fixed;inset:0;z-index:999;background:rgba(3,20,22,.8);display:flex;align-items:center;justify-content:center;padding:16px';
+      w.innerHTML = '<div style="max-width:480px;background:#0f3d42;color:#f3fbfa;border:1px solid #24666d;border-radius:18px;padding:20px 22px;font:16px/1.5 Nunito,system-ui,sans-serif">' +
+        '<h3 style="margin:0 0 8px;font-family:Fredoka,sans-serif">IA sin espera</h3>' +
+        '<p style="margin:0 0 10px">Sin llave, la IA gratis responde una vez cada 45 segundos por conexión (en una escuela con un solo wifi, se comparte). Con una llave gratis propia responde enseguida.</p>' +
+        '<ol style="margin:0 0 10px;padding-left:20px"><li>Entrá a <a href="https://enter.pollinations.ai" target="_blank" rel="noopener" style="color:#ffd23f">enter.pollinations.ai</a> y creá una cuenta gratis.</li><li>Creá una llave y copiala.</li><li>Pegala acá. Queda guardada solo en este aparato.</li></ol>' +
+        '<input id="kIn" type="password" placeholder="pk_… o sk_…" style="width:100%;padding:10px 12px;border-radius:12px;border:2px solid #24666d;background:#082629;color:#fff;font:inherit">' +
+        '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px"><button class="btn" id="kOk" type="button">Guardar</button><button class="btn alt" id="kDel" type="button">Quitar llave</button><button class="btn alt" id="kX" type="button">Cerrar</button></div></div>';
+      document.body.appendChild(w);
+      const close = () => { w.remove(); paint(); };
+      w.querySelector('#kIn').value = getKey();
+      w.querySelector('#kOk').onclick = () => { try { localStorage.setItem(KEYS, w.querySelector('#kIn').value.trim()); } catch (e) {} close(); };
+      w.querySelector('#kDel').onclick = () => { try { localStorage.removeItem(KEYS); } catch (e) {} close(); };
+      w.querySelector('#kX').onclick = close;
+      w.onclick = e => { if (e.target === w) close(); };
+    };
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => setTimeout(keyUI, 50)); else setTimeout(keyUI, 50);
+})();
+
+</script>
 <script>/* core.js */
 /* Órbita: utilidades compartidas (guardado, XP, sonido, IA, voz, pantalla de juego) */
 window.ORB = (function () {
@@ -8987,7 +9118,7 @@ window.ORB = (function () {
   ta.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); $('#iaForm').requestSubmit(); } });
   $('#iaForm').onsubmit = e => { e.preventDefault(); const v = ta.value; ta.value = ''; ta.style.height = 'auto'; sendChat(v); };
   $('#iaNew').onclick = () => { if (chatCtrl) chatCtrl.abort(); chat = []; O.store.set('chat', chat); paintChat(); busy = false; $('#iaSend').disabled = false; };
-  O.getSample().then(s => { $('#iaStatus').textContent = s ? 'En línea · responde con Claude' : 'Se activa al abrir Órbita desde su página publicada'; });
+  O.getSample().then(s => { $('#iaStatus').textContent = s ? 'En línea · IA gratis' : 'Se activa al abrir Órbita desde su página publicada'; });
 
   O.paintXP();
   route();

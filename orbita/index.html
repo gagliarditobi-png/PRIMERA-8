@@ -71,9 +71,9 @@ small{color:#a9d0ce}
   <ol>
     <li><b>Compu (Chrome o Edge):</b> ícono de instalar en la barra de direcciones, o menú ⋮ → <b>Instalar Órbita</b>.</li>
     <li><b>Android (Chrome):</b> menú ⋮ → <b>Instalar app</b> o <b>Agregar a pantalla principal</b>.</li>
-    <li><b>iPhone o iPad (Safari):</b> botón Compartir → <b>Agregar a inicio</b>.</li>
+    <li><b>iPhone o iPad (Safari, Chrome, Edge o Firefox):</b> botón Compartir → <b>Agregar a pantalla de inicio</b>.</li>
   </ol>
-  <p><small>La IA, las clases en vivo, compartir con el curso, el dictado y Spotify funcionan desde la página de Órbita en Claude; en la app instalada, el resto anda igual y sin conexión una vez abierto. Cada instalación suma una descarga al contador.</small></p>
+  <p><small>La IA (chat, exámenes, libros, tarjetas y más) y el dictado por voz funcionan en la app instalada, con internet. Las clases en vivo, compartir con el curso y Spotify funcionan desde la página de Órbita en Claude. Cada instalación suma una descarga al contador.</small></p>
 </main>
 <div class="msg" id="msg" role="dialog" aria-modal="true"><div class="box" id="box"></div></div>
 <script>
@@ -93,7 +93,11 @@ msg.addEventListener('click',e=>{if(e.target===msg)msg.classList.remove('on')});
 addEventListener('appinstalled',()=>{hit();btn.textContent='✔ Órbita instalada';show('<h3>¡Listo!</h3><p>Órbita ya está en tu compu o celular, con su ícono. Buscala en tus apps.</p><div class="row"><a class="b y" href="app.html">Abrir Órbita</a></div>')});
 const ua=navigator.userAgent,ios=/iPad|iPhone|iPod/.test(ua)||(navigator.platform==='MacIntel'&&navigator.maxTouchPoints>1);
 function manual(){
-  if(ios)return show('<h3>En iPhone o iPad</h3><ol><li>Abrí esta página en <b>Safari</b>.</li><li>Tocá el botón <b>Compartir</b> (el cuadrado con la flecha).</li><li>Elegí <b>Agregar a inicio</b> y después <b>Agregar</b>.</li></ol>');
+  if(ios){
+    const br=/CriOS/.test(ua)?'Chrome':/EdgiOS/.test(ua)?'Edge':/FxiOS/.test(ua)?'Firefox':/OPiOS|OPT\//.test(ua)?'Opera':'Safari';
+    const paso=br==='Chrome'?'Tocá el botón <b>Compartir</b> (el cuadrado con la flecha, arriba a la derecha de la barra de direcciones).':br==='Safari'?'Tocá el botón <b>Compartir</b> (el cuadrado con la flecha, abajo o arriba).':'Abrí el menú del navegador y tocá <b>Compartir</b>.';
+    return show('<h3>En iPhone o iPad ('+br+')</h3><p>Funciona con el navegador que estás usando, no hace falta Safari.</p><ol><li>'+paso+'</li><li>Elegí <b>Agregar a pantalla de inicio</b> (si no aparece, deslizá la lista para abajo).</li><li>Dejá activado <b>Abrir como app web</b> y tocá <b>Agregar</b>.</li></ol><p><small>En iPhone, Apple no deja que ninguna página se instale con un solo toque: siempre es desde Compartir. Hace falta iOS 16.4 o más nuevo para hacerlo desde Chrome, Edge o Firefox.</small></p>');
+  }
   if(/Firefox/.test(ua))return show('<h3>En Firefox</h3><p>Firefox de compu no instala apps web. Abrí esta página en <b>Chrome</b> o <b>Edge</b> y tocá Descargar. En Android: menú ⋮ → <b>Instalar</b>.</p>');
   if(/Safari/.test(ua)&&!/Chrome|Chromium|Edg/.test(ua))return show('<h3>En Safari de Mac</h3><p>Menú <b>Archivo → Agregar al Dock</b>.</p>');
   show('<h3>Casi listo</h3><p>Tu navegador no mostró el cartel. Usá el menú ⋮ → <b>Instalar Órbita</b> (o <b>Agregar a pantalla principal</b>), o el ícono de instalar en la barra de direcciones. Si ya la instalaste, buscala en tus apps.</p><div class="row"><a class="b y" href="app.html">Usarla en el navegador</a></div>');
