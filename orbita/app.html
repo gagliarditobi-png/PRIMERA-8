@@ -420,7 +420,7 @@ button{cursor:pointer}
     client.on('connect', () => { pub(); });
     setTimeout(() => firePeers(), 1200);
     return {
-      presence(p) { myPres = p; pub(); firePeers(); },
+      presence(p) { myPres = Object.assign({}, myPres || {}, p || {}); pub(); firePeers(); },
       onPeers(f) { peerL.add(f); setTimeout(() => f({ peers: list(), joined: [], left: [] }), 0); return () => peerL.delete(f); },
       on(t, f) { if (!evL.has(t)) evL.set(t, new Set()); evL.get(t).add(f); return () => evL.get(t).delete(f); },
       async emit(t, d) { if (!alive) return; client.publish(eTopic, await seal(key, { t, d, from: me, ts: Date.now() }), { qos: 0 }); },
@@ -7854,7 +7854,7 @@ window.ORB = (function () {
       on('q', d => { phase = 'q'; cq = { i: +d.i, n: +d.n, q: String(d.q || ''), o: (d.o || []).map(String).slice(0, 4), s: +d.s || 20 }; myAns = null; recvAt = Date.now(); paintSt(); clearInterval(timer); timer = setInterval(() => { const t = el.querySelector('.tm'); const left = cq.s - (Date.now() - recvAt) / 1000; if (t) t.textContent = Math.max(0, Math.ceil(left)); }, 250); });
       on('rev', d => { phase = 'rev'; clearInterval(timer); rev = d; paintSt(); if (myAns && cq && myAns.k === d.c) O.sfx.ok(); else O.sfx.bad(); });
       on('end', d => { phase = 'end'; clearInterval(timer); rev = d; paintSt(); O.sfx.win(); });
-      unsubs.push(R.onPeers(ch => { const me = ch.peers.find(p => p.sameTab); if (me) myPeer = me.peer; const hostHere = ch.peers.some(p => p.presence && p.presence.role === 'host'); if (!hostHere && phase === 'lobby') { const w = el.querySelector('#wait'); if (w) w.textContent = 'Esperando a que el profe abra la trivia con este código…'; } }));
+      unsubs.push(R.onPeers(ch => { const me = ch.peers.find(p => p.sameTab); if (me) myPeer = me.peer; const hostHere = ch.peers.some(p => p.presence && p.presence.role === 'host'); if (phase === 'lobby') { const w = el.querySelector('#wait'); if (w) w.textContent = hostHere ? 'Mirá la pantalla del profe. La trivia empieza en un momento.' : 'Esperando a que el profe abra la trivia con este código…'; } }));
       paintSt();
     }
     function paintSt() {
