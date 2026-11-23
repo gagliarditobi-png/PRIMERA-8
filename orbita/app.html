@@ -177,7 +177,7 @@ button{cursor:pointer}
     <span>Órbita</span>
   </a>
   <nav class="nav" id="nav">
-    <a href="#inicio">Inicio</a><a href="#buscar">Buscador</a><a href="#ia">IA</a><a href="#estudio">Estudio</a><a href="#bienestar">Bienestar</a><a href="#educativos">Educativos</a><a href="#accesibles">Accesibles</a><a href="#ninos">Niños</a><a href="#juegos">Juegos</a><a href="#idiomas">Idiomas</a>
+    <a href="#inicio">Inicio</a><a href="#buscar">Buscador</a><a href="#ia">IA</a><a href="#chat">Chat</a><a href="#estudio">Estudio</a><a href="#bienestar">Bienestar</a><a href="#educativos">Educativos</a><a href="#accesibles">Accesibles</a><a href="#ninos">Niños</a><a href="#juegos">Juegos</a><a href="#idiomas">Idiomas</a>
   </nav>
   <div class="xp" title="Tu experiencia total"><b data-xp>0</b> XP</div>
 </header>
@@ -227,6 +227,7 @@ button{cursor:pointer}
   <div class="ggrid" id="eduGrid" style="margin-top:18px"></div>
 </section>
 
+<section id="v-chat" class="view"><div id="chatRoot"></div></section>
 <section id="v-ia" class="view band">
   <div class="chat">
     <div class="chatHead">
@@ -266,7 +267,7 @@ button{cursor:pointer}
 </div>
 
 <script>/* ia-web.js */
-/* IA y dictado para la app instalada (GitHub): reemplaza a window.claude cuando Órbita no corre adentro de Claude.
+/* IA, dictado y salas en vivo para la app instalada (GitHub): reemplaza a window.claude cuando Órbita no corre adentro de Claude.
    IA: Pollinations (gratis, sin cuenta: 1 respuesta cada ~45 s por conexión; con llave propia gratuita, sin espera).
    Dictado: el reconocimiento de voz del navegador (Chrome, Edge, Android, Safari). */
 (function () {
@@ -359,11 +360,81 @@ button{cursor:pointer}
     };
   }
 
+
+  /* salas en vivo (trivia, clase y chat) por MQTT público, con todo cifrado con el nombre de la sala */
+  const BROKERS = ['wss://broker.hivemq.com:8884/mqtt', 'wss://broker.emqx.io:8084/mqtt'];
+  let mqttP = null;
+  const loadMqtt = () => mqttP || (mqttP = new Promise((res, rej) => { if (window.mqtt) return res(window.mqtt); const s = document.createElement('script'); s.src = 'https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js'; s.onload = () => window.mqtt ? res(window.mqtt) : rej(); s.onerror = () => { mqttP = null; rej(); }; document.head.appendChild(s); }));
+  const enc = new TextEncoder(), dec = new TextDecoder();
+  const hex = b => Array.from(new Uint8Array(b), x => x.toString(16).padStart(2, '0')).join('');
+  const b64 = u => { let s = ''; u.forEach(x => s += String.fromCharCode(x)); return btoa(s); };
+  const unb64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+  async function roomKeys(name) {
+    const h = hex(await crypto.subtle.digest('SHA-256', enc.encode('orbita-sala|' + name))).slice(0, 28);
+    const base = await crypto.subtle.importKey('raw', enc.encode(name), 'PBKDF2', false, ['deriveKey']);
+    const key = await crypto.subtle.deriveKey({ name: 'PBKDF2', salt: enc.encode('orbita-sal-v1'), iterations: 60000, hash: 'SHA-256' }, base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+    return { topic: 'orbita-v1/' + h, key };
+  }
+  async function seal(key, obj) { const iv = crypto.getRandomValues(new Uint8Array(12)); const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, enc.encode(JSON.stringify(obj)))); const out = new Uint8Array(12 + ct.length); out.set(iv); out.set(ct, 12); return b64(out); }
+  async function open_(key, txt) { try { const u = unb64(txt); const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: u.slice(0, 12) }, key, u.slice(12)); return JSON.parse(dec.decode(pt)); } catch (e) { return null; } }
+  async function joinRoom(name) {
+    const lib = await loadMqtt();
+    const { topic, key } = await roomKeys(String(name));
+    const me = 'p' + Math.random().toString(36).slice(2, 12);
+    const pTopic = topic + '/p/' + me, eTopic = topic + '/e';
+    let client = null;
+    for (const url of BROKERS) {
+      try {
+        client = await new Promise((res, rej) => {
+          const c = lib.connect(url, { clientId: 'orb_' + me, clean: true, keepalive: 30, reconnectPeriod: 3000, connectTimeout: 8000, will: { topic: pTopic, payload: '', qos: 1, retain: true } });
+          const t = setTimeout(() => { try { c.end(true); } catch (e) {} rej(); }, 9000);
+          c.once('connect', () => { clearTimeout(t); res(c); });
+          c.once('error', () => { clearTimeout(t); try { c.end(true); } catch (e) {} rej(); });
+        });
+        break;
+      } catch (e) { client = null; }
+    }
+    if (!client) throw { code: 'unavailable' };
+    const peers = new Map(); /* id -> {presence, seen} */
+    const evL = new Map(), peerL = new Set();
+    let myPres = null, alive = true;
+    const list = () => [{ peer: me, sameTab: true, kind: 'viewer', presence: myPres }].concat([...peers].map(([id, v]) => ({ peer: id, sameTab: false, kind: 'viewer', presence: v.presence })));
+    const firePeers = (joined, left) => { const ch = { peers: list(), joined: joined || [], left: left || [] }; peerL.forEach(f => { try { f(ch); } catch (e) {} }); };
+    client.on('message', async (tp, buf) => {
+      const txt = dec.decode(buf);
+      if (tp.startsWith(topic + '/p/')) {
+        const id = tp.slice(topic.length + 3); if (id === me) return;
+        if (!txt) { if (peers.delete(id)) firePeers([], [{ peer: id, sameTab: false, kind: 'viewer' }]); return; }
+        const d = await open_(key, txt); if (!d || Math.abs(Date.now() - (+d.ts || 0)) > 95000) return;
+        const isNew = !peers.has(id); peers.set(id, { presence: d.p, seen: Date.now() });
+        firePeers(isNew ? [{ peer: id, sameTab: false, kind: 'viewer', presence: d.p }] : []);
+      } else if (tp === eTopic) {
+        const d = await open_(key, txt); if (!d || !d.t) return;
+        if (d.from && peers.has(d.from)) peers.get(d.from).seen = Date.now();
+        const fs = evL.get(d.t); if (fs) fs.forEach(f => { try { f({ data: d.d, sameTab: d.from === me, peer: d.from }); } catch (e) {} });
+      }
+    });
+    client.subscribe([topic + '/p/+', eTopic], { qos: 0 });
+    const pub = async () => { if (!alive || !myPres) return; client.publish(pTopic, await seal(key, { p: myPres, ts: Date.now() }), { qos: 1, retain: true }); };
+    const hb = setInterval(() => { pub(); const cut = Date.now() - 80000; const gone = []; peers.forEach((v, id) => { if (v.seen < cut) { peers.delete(id); gone.push({ peer: id, sameTab: false, kind: 'viewer' }); } }); if (gone.length) firePeers([], gone); }, 25000);
+    client.on('connect', () => { pub(); });
+    setTimeout(() => firePeers(), 1200);
+    return {
+      presence(p) { myPres = p; pub(); firePeers(); },
+      onPeers(f) { peerL.add(f); setTimeout(() => f({ peers: list(), joined: [], left: [] }), 0); return () => peerL.delete(f); },
+      on(t, f) { if (!evL.has(t)) evL.set(t, new Set()); evL.get(t).add(f); return () => evL.get(t).delete(f); },
+      async emit(t, d) { if (!alive) return; client.publish(eTopic, await seal(key, { t, d, from: me, ts: Date.now() }), { qos: 0 }); },
+      leave() { if (!alive) return; alive = false; clearInterval(hb); try { client.publish(pTopic, '', { qos: 1, retain: true }, () => client.end()); setTimeout(() => { try { client.end(true); } catch (e) {} }, 1500); } catch (e) {} }
+    };
+  }
+  const roomCap = { join: joinRoom };
+
   window.claude = {
     web: true,
     use(name) {
       if (name === 'sample') return Promise.resolve(sample);
       if (name === 'dictation') return Promise.resolve(dictation());
+      if (name === 'room') return Promise.resolve(window.crypto && crypto.subtle && window.WebSocket ? roomCap : null);
       return Promise.reject({ code: 'unavailable' });
     }
   };
@@ -8958,6 +9029,387 @@ window.ORB = (function () {
 })();
 
 </script>
+<script>/* chat.js */
+/* Chat de Órbita: estilo WhatsApp, para chatear con alumnos, el curso o amigos por código. La foto de perfil es tu Orbi vestido. */
+(function () {
+  const O = ORB;
+  const use = n => { try { if (window.claude && window.claude.use) return window.claude.use(n).catch(() => null); } catch (e) {} return Promise.resolve(null); };
+  const $ = s => document.querySelector(s);
+  const esc = s => O.esc(String(s == null ? '' : s));
+  const rid = n => Array.from({ length: n }, () => 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'[Math.floor(Math.random() * 32)]).join('');
+  const now = () => Date.now();
+
+  /* ---------- perfil ---------- */
+  let ME = O.store.get('chat.me', null);
+  if (!ME) { ME = { id: rid(10), name: '', st: 'Hola, estoy usando Órbita 🪐', escuela: true }; O.store.set('chat.me', ME); }
+  const myLook = () => { try { return O.orbiLook ? JSON.parse(JSON.stringify(O.orbiLook())) : null; } catch (e) { return null; } };
+  const LOOKS = O.store.get('chat.looks', {});
+  const saveLooks = () => O.store.set('chat.looks', LOOKS);
+
+  /* foto de perfil: la cabeza de tu Orbi (con su fondo), recortada en círculo */
+  function avatar(look, size, extra) {
+    size = size || 40;
+    if (!look || !O.orbiSVG) return '<span class="waAv" style="width:' + size + 'px;height:' + size + 'px;' + (extra || '') + '"><svg viewBox="0 0 40 40"><rect width="40" height="40" fill="#cfd8dc"/><circle cx="20" cy="15" r="8" fill="#fff"/><path d="M5 40q15-22 30 0" fill="#fff"/></svg></span>';
+    return '<span class="waAv" style="width:' + size + 'px;height:' + size + 'px;' + (extra || '') + '"><svg viewBox="22 2 256 256" preserveAspectRatio="xMidYMid slice">' + O.orbiSVG(look) + '</svg></span>';
+  }
+  const groupAv = (c, size) => {
+    const ids = Object.keys(c.members || {}).filter(id => id !== ME.id && LOOKS[id]);
+    if (ids.length === 1 && !c.group) return avatar(LOOKS[ids[0]], size);
+    const col = ['#25d366', '#34b7f1', '#ff9600', '#ce82ff', '#ff5d47', '#00bfa6'][(c.code.charCodeAt(0) + c.code.charCodeAt(1)) % 6];
+    return '<span class="waAv" style="width:' + size + 'px;height:' + size + 'px;background:' + col + ';display:inline-flex;align-items:center;justify-content:center;color:#fff;font:700 ' + Math.round(size * 0.42) + 'px Fredoka,sans-serif">' + esc((c.name || '#').trim().slice(0, 1).toUpperCase()) + '</span>';
+  };
+
+  /* ---------- chats guardados en este aparato ---------- */
+  let LIST = O.store.get('chat.list', []);
+  const saveList = () => O.store.set('chat.list', LIST);
+  const MSGS = {};
+  const msgs = code => MSGS[code] || (MSGS[code] = O.store.get('chat.m.' + code, []));
+  const saveMsgs = code => O.store.set('chat.m.' + code, msgs(code).slice(-300));
+  const chatOf = code => LIST.find(c => c.code === code);
+
+  /* modo escuela: tapa malas palabras */
+  const BAD = ['boludo', 'boluda', 'pelotudo', 'pelotuda', 'forro', 'forra', 'puto', 'puta', 'mierda', 'concha', 'verga', 'pija', 'chota', 'garcha', 'idiota', 'estupido', 'estúpido', 'tarado', 'tarada', 'mogolico', 'mogólico', 'hdp', 'ctm', 'culiao', 'gil', 'imbecil', 'imbécil', 'cagon', 'cagón', 'trolo'];
+  const BADRE = new RegExp('(^|[^a-záéíóúñü])(' + BAD.join('|') + ')(?=$|[^a-záéíóúñü])', 'gi');
+  const clean = t => ME.escuela ? t.replace(BADRE, (m, a, w) => a + '★'.repeat(w.length)) : t;
+
+  /* ---------- conexión en vivo ---------- */
+  const CONN = {};
+  let roomCap = null, roomTried = false, typingT = 0;
+  async function getRoom() { if (!roomTried) { roomTried = true; roomCap = await use('room'); } return roomCap; }
+  function presence(code) {
+    const k = CONN[code]; if (!k || !k.R) return;
+    try { k.R.presence({ id: ME.id, name: ME.name || 'Sin nombre', st: ME.st || '', look: myLook(), typing: k.typing ? 1 : 0 }); } catch (e) {}
+  }
+  async function connect(code) {
+    if (CONN[code]) return CONN[code];
+    const k = CONN[code] = { R: null, peers: [], unsubs: [], state: 'conectando', typing: false, answered: {} };
+    const room = await getRoom();
+    if (!room) { k.state = 'sin'; paintHead(); return k; }
+    try { k.R = await room.join('chat-' + code.toLowerCase()); } catch (e) { k.state = 'sin'; paintHead(); return k; }
+    k.state = 'ok';
+    presence(code);
+    const on = (t, f) => k.unsubs.push(k.R.on(t, m => { if (!m.sameTab) f(m.data || {}, m); }));
+    on('msg', d => addMsg(code, d, true));
+    on('need', d => {
+      if (!d.rq) return; const since = +d.since || 0;
+      setTimeout(() => {
+        if (k.answered[d.rq]) return; k.answered[d.rq] = 1;
+        const c = chatOf(code);
+        const list = msgs(code).filter(m => m.t > since).slice(-80);
+        k.R.emit('hist', { rq: d.rq, name: c && c.name, group: c && c.group, msgs: list }).catch(() => {});
+      }, 150 + Math.random() * 900);
+    });
+    on('hist', d => {
+      if (d.rq) k.answered[d.rq] = 1;
+      const c = chatOf(code); if (c && d.name && (!c.name || c.name === 'Chat ' + code)) { c.name = String(d.name).slice(0, 40); c.group = !!d.group; saveList(); }
+      (d.msgs || []).slice(-80).forEach(m => addMsg(code, m, false));
+      paintList(); if (cur === code) { paintHead(); paintMsgs(); }
+    });
+    on('seen', d => { const c = chatOf(code); if (!c) return; const t = +d.t || 0; if (t > (c.seenBy || 0)) { c.seenBy = t; saveList(); if (cur === code) paintMsgs(); } });
+    k.unsubs.push(k.R.onPeers(ch => {
+      k.peers = ch.peers || [];
+      const c = chatOf(code);
+      k.peers.forEach(p => { const pr = p.presence; if (!pr || !pr.id || pr.id === ME.id) return; if (pr.look) LOOKS[pr.id] = pr.look; if (c) { c.members = c.members || {}; c.members[pr.id] = String(pr.name || 'Alguien').slice(0, 30); } });
+      saveLooks(); if (c) saveList();
+      if (!k.asked && k.peers.some(p => !p.sameTab)) { k.asked = true; const rq = rid(8); k.answered[rq] = 1; const m = msgs(code); k.R.emit('need', { rq, since: m.length ? m[m.length - 1].t - 1 : 0 }).catch(() => {}); }
+      paintList(); if (cur === code) { paintHead(); if (document.visibilityState === 'visible') seen(code); }
+    }));
+    paintHead();
+    return k;
+  }
+  function addMsg(code, d, live) {
+    if (!d || !d.id || !d.f) return;
+    const L = msgs(code); if (L.some(m => m.id === d.id)) return;
+    const m = { id: String(d.id).slice(0, 20), f: String(d.f).slice(0, 20), n: String(d.n || 'Alguien').slice(0, 30), t: +d.t || now(), k: d.k === 'orbi' ? 'orbi' : 'txt', x: String(d.x || '').slice(0, 1000) };
+    if (d.l && m.k === 'orbi') m.l = d.l;
+    L.push(m); L.sort((a, b) => a.t - b.t); saveMsgs(code);
+    const c = chatOf(code);
+    if (c) { c.last = Math.max(c.last || 0, m.t); if (m.f !== ME.id && !(cur === code && viewOn())) c.unread = (c.unread || 0) + 1; c.members = c.members || {}; if (m.f !== ME.id) c.members[m.f] = m.n; saveList(); }
+    if (live && m.f !== ME.id) { if (cur === code && viewOn()) { O.sfx.pop && O.sfx.pop(); seen(code); } else { try { O.tone(880, 0.08, 'sine', 0.05); O.tone(1320, 0.1, 'sine', 0.05, 0, 0.08); } catch (e) {} } }
+    paintList(); badge(); if (cur === code) paintMsgs();
+  }
+  let seenT = 0;
+  function seen(code) { const k = CONN[code]; if (!k || !k.R) return; const L = msgs(code); if (!L.length) return; if (now() - seenT < 1500) return; seenT = now(); k.R.emit('seen', { t: L[L.length - 1].t }).catch(() => {}); }
+  function send(kind, text) {
+    if (!cur) return; const k = CONN[cur];
+    const m = { id: rid(12), f: ME.id, n: ME.name || 'Sin nombre', t: now(), k: kind, x: kind === 'txt' ? clean(text) : '' };
+    if (kind === 'orbi') m.l = myLook();
+    m.d = k && k.peers.some(p => !p.sameTab) ? 2 : 1;
+    msgs(cur).push(m); saveMsgs(cur);
+    const c = chatOf(cur); if (c) { c.last = m.t; saveList(); }
+    if (k && k.R) k.R.emit('msg', m).catch(() => {});
+    paintMsgs(); paintList(); O.addXP && O.addXP(1);
+  }
+
+  /* ---------- pantalla ---------- */
+  let cur = null, root = null, pane = 'list';
+  const viewOn = () => location.hash === '#chat' && document.visibilityState === 'visible';
+  const hhmm = t => { const d = new Date(t); return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0'); };
+  const dayLbl = t => { const d = new Date(t), n = new Date(); const y = new Date(n - 864e5); if (d.toDateString() === n.toDateString()) return 'Hoy'; if (d.toDateString() === y.toDateString()) return 'Ayer'; return d.toLocaleDateString('es-AR', { day: 'numeric', month: 'long' }); };
+  const listTime = t => { if (!t) return ''; const d = new Date(t), n = new Date(); return d.toDateString() === n.toDateString() ? hhmm(t) : dayLbl(t); };
+  const linkify = s => esc(s).replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1" target="_blank" rel="noopener">$1</a>');
+
+  function badge() {
+    const n = LIST.reduce((a, c) => a + (c.unread || 0), 0);
+    const a = document.querySelector('#nav a[href="#chat"]'); if (!a) return;
+    let b = a.querySelector('.waBadge'); if (!n) { if (b) b.remove(); return; }
+    if (!b) { b = document.createElement('b'); b.className = 'waBadge'; a.appendChild(b); } b.textContent = n > 99 ? '99+' : n;
+  }
+
+  function render() {
+    root = $('#chatRoot'); if (!root) return;
+    if (!ME.name) return profile(true);
+    root.innerHTML = '<div class="wa" data-pane="' + pane + '">' +
+      '<aside class="waSide"><div class="waTop"><button class="waMe" id="waMe" title="Tu perfil">' + avatar(myLook(), 40) + '</button><b class="waTitle">Chats</b><button class="waIco" id="waNew" title="Nuevo chat" aria-label="Nuevo chat"><svg viewBox="0 0 24 24"><path d="M19 3H5a2 2 0 0 0-2 2v14l4-4h12a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2zm-6 9h-2V9H8V7h3V4h2v3h3v2h-3z" fill="currentColor"/></svg></button></div>' +
+      '<div class="waSearch"><input id="waQ" placeholder="Buscar un chat" aria-label="Buscar un chat"></div><div class="waList" id="waList"></div></aside>' +
+      '<section class="waMain" id="waMain"></section></div>';
+    root.querySelector('#waMe').onclick = () => profile(false);
+    root.querySelector('#waNew').onclick = newChat;
+    root.querySelector('#waQ').oninput = paintList;
+    paintList(); paintMain();
+    LIST.slice(0, 10).forEach(c => connect(c.code));
+    if (pendingJoin) { const p = pendingJoin; pendingJoin = null; joinCode(p); }
+  }
+  function paintList() {
+    const el = root && root.querySelector('#waList'); if (!el) return;
+    const q = O.norm ? O.norm((root.querySelector('#waQ') || {}).value || '') : '';
+    const L = LIST.slice().sort((a, b) => (b.last || b.created || 0) - (a.last || a.created || 0)).filter(c => !q || (O.norm ? O.norm(c.name || '') : c.name).includes(q));
+    if (!LIST.length) { el.innerHTML = '<div class="waEmpty"><p>Todavía no tenés chats.</p><button class="btn" id="waFirst">Empezar un chat</button></div>'; el.querySelector('#waFirst').onclick = newChat; return; }
+    el.innerHTML = L.map(c => {
+      const M = msgs(c.code), last = M[M.length - 1], k = CONN[c.code];
+      const typing = k && k.peers.find(p => !p.sameTab && p.presence && p.presence.typing);
+      const prev = typing ? '<i class="waTyping">' + esc(typing.presence.name) + ' está escribiendo…</i>' : last ? (last.f === ME.id ? tick(last, c) : (c.group ? esc(last.n) + ': ' : '')) + (last.k === 'orbi' ? '🪐 Sticker de Orbi' : esc(last.x)) : '<i>Código ' + c.code + '</i>';
+      return '<button class="waItem' + (c.code === cur ? ' on' : '') + '" data-c="' + c.code + '">' + groupAv(c, 49) + '<span class="waTx"><span class="waL1"><b>' + esc(c.name) + '</b><small' + (c.unread ? ' class="un"' : '') + '>' + listTime(last ? last.t : c.created) + '</small></span><span class="waL2"><span class="waPrev">' + prev + '</span>' + (c.unread ? '<span class="waUn">' + c.unread + '</span>' : '') + '</span></span></button>';
+    }).join('');
+    el.querySelectorAll('[data-c]').forEach(b => b.onclick = () => openChat(b.dataset.c));
+  }
+  function tick(m, c) {
+    const blue = c && c.seenBy >= m.t;
+    const two = blue || m.d === 2 || (CONN[c.code] && CONN[c.code].peers.some(p => !p.sameTab));
+    return '<span class="waTk' + (blue ? ' blue' : '') + '">' + (two ? '<svg viewBox="0 0 18 12"><path d="M1 6.5l3.2 3.2L11 2.5M7.5 9.2l.5.5L15.8 2" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>' : '<svg viewBox="0 0 18 12"><path d="M3 6.5l3.2 3.2L13 2.5" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>') + '</span>';
+  }
+  function openChat(code) {
+    cur = code; pane = 'chat'; const c = chatOf(code); if (c) { c.unread = 0; saveList(); }
+    connect(code); badge();
+    const w = root.querySelector('.wa'); if (w) w.dataset.pane = 'chat';
+    paintList(); paintMain(); seen(code);
+  }
+  function paintMain() {
+    const el = root && root.querySelector('#waMain'); if (!el) return;
+    const c = cur && chatOf(cur);
+    if (!c) { el.innerHTML = '<div class="waHello">' + avatar(myLook(), 120, 'box-shadow:0 6px 20px rgba(0,0,0,.15)') + '<h2>Chat de Órbita</h2><p>Chateá con tu curso, tus alumnos o tus amigos. Creá un chat, pasá el código y listo.</p><p class="waLock">🔒 Los mensajes viajan cifrados con el código del chat. No compartas datos personales como tu dirección o teléfono.</p></div>'; return; }
+    el.innerHTML = '<div class="waHead"><button class="waIco waBack" id="waBack" aria-label="Volver"><svg viewBox="0 0 24 24"><path d="M20 11H7.8l5.6-5.6L12 4l-8 8 8 8 1.4-1.4L7.8 13H20z" fill="currentColor"/></svg></button><button class="waHInfo" id="waInfo">' + groupAv(c, 40) + '<span><b id="waHName">' + esc(c.name) + '</b><small id="waSub"></small></span></button><button class="waIco" id="waInv" title="Invitar" aria-label="Invitar"><svg viewBox="0 0 24 24"><path d="M15 12a4 4 0 1 0-4-4 4 4 0 0 0 4 4zm-9-2V7H4v3H1v2h3v3h2v-3h3v-2zm9 4c-2.7 0-8 1.3-8 4v2h16v-2c0-2.7-5.3-4-8-4z" fill="currentColor"/></svg></button></div>' +
+      '<div class="waMsgs" id="waMsgs"></div>' +
+      '<div class="waEmo" id="waEmo" hidden>' + '😀 😂 🤣 😊 😍 😎 🤔 😮 😢 😡 👍 👎 👏 🙌 🙏 💪 ❤️ 💙 💚 💛 🔥 ⭐ 🎉 🎂 ⚽ 🏆 📚 ✏️ 🧠 🪐 🚀 🌈 🐶 🐱 🍕 🍦 ✅ ❌ ❓ 👋'.split(' ').map(e => '<button type="button">' + e + '</button>').join('') + '<button type="button" class="waStk" id="waStk">' + avatar(myLook(), 34) + ' Mandar mi Orbi</button></div>' +
+      '<form class="waBar" id="waBar"><button type="button" class="waIco" id="waEmoB" aria-label="Emojis"><svg viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm0 18a8 8 0 1 1 8-8 8 8 0 0 1-8 8zm-3.5-9A1.5 1.5 0 1 0 7 9.5 1.5 1.5 0 0 0 8.5 11zm7 0A1.5 1.5 0 1 0 14 9.5a1.5 1.5 0 0 0 1.5 1.5zM12 17.5a5.5 5.5 0 0 0 5.1-3.5H6.9a5.5 5.5 0 0 0 5.1 3.5z" fill="currentColor"/></svg></button><textarea id="waIn" rows="1" placeholder="Escribí un mensaje" aria-label="Mensaje" maxlength="1000"></textarea><button class="waSend" aria-label="Enviar"><svg viewBox="0 0 24 24"><path d="M2 21l21-9L2 3v7l15 2-15 2z" fill="currentColor"/></svg></button></form>';
+    el.querySelector('#waBack').onclick = () => { pane = 'list'; cur = null; root.querySelector('.wa').dataset.pane = 'list'; paintList(); paintMain(); };
+    el.querySelector('#waInfo').onclick = () => info(c);
+    el.querySelector('#waInv').onclick = () => invite(c);
+    const inp = el.querySelector('#waIn'), emo = el.querySelector('#waEmo');
+    inp.addEventListener('input', () => {
+      inp.style.height = 'auto'; inp.style.height = Math.min(120, inp.scrollHeight) + 'px';
+      const k = CONN[cur]; if (!k) return; if (!k.typing) { k.typing = true; presence(cur); } clearTimeout(typingT); typingT = setTimeout(() => { k.typing = false; presence(c.code); }, 2500);
+    });
+    inp.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); el.querySelector('#waBar').requestSubmit(); } });
+    el.querySelector('#waBar').onsubmit = e => { e.preventDefault(); const v = inp.value.trim(); if (!v) return; inp.value = ''; inp.style.height = 'auto'; const k = CONN[cur]; if (k && k.typing) { k.typing = false; presence(cur); } send('txt', v); emo.hidden = true; };
+    el.querySelector('#waEmoB').onclick = () => { emo.hidden = !emo.hidden; };
+    emo.onclick = e => { const b = e.target.closest('button'); if (!b) return; if (b.id === 'waStk') { send('orbi'); emo.hidden = true; return; } inp.value += b.textContent; inp.focus(); };
+    paintHead(); paintMsgs();
+    if (matchMedia('(pointer:fine)').matches) inp.focus();
+  }
+  function paintHead() {
+    const s = root && root.querySelector('#waSub'); if (!s || !cur) return;
+    const k = CONN[cur], c = chatOf(cur);
+    const hn = root.querySelector('#waHName'); if (hn && c && hn.textContent !== c.name) hn.textContent = c.name;
+    if (!k || k.state === 'conectando') { s.textContent = 'conectando…'; return; }
+    if (k.state === 'sin') { s.textContent = 'sin conexión en vivo: necesita internet'; return; }
+    const others = k.peers.filter(p => !p.sameTab && p.presence);
+    const ty = others.find(p => p.presence.typing);
+    if (ty) { s.innerHTML = '<i class="waTyping">' + esc(ty.presence.name) + ' está escribiendo…</i>'; return; }
+    const names = [...new Set(others.map(p => String(p.presence.name || 'Alguien').slice(0, 20)))];
+    s.textContent = c && c.group ? (names.length ? 'en línea: ' + names.join(', ') : 'código ' + c.code + ' · nadie más en línea') : (names.length ? 'en línea' : 'código ' + c.code);
+  }
+  function paintMsgs() {
+    const el = root && root.querySelector('#waMsgs'); if (!el || !cur) return;
+    const c = chatOf(cur), L = msgs(cur);
+    const atEnd = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    let h = '<div class="waNote">🔒 Mensajes cifrados con el código <b>' + c.code + '</b>. Solo los ve quien tenga el código.' + (ME.escuela ? ' Modo escuela: las malas palabras se tapan.' : '') + '</div>', lastDay = '', prev = null;
+    L.forEach(m => {
+      const d = dayLbl(m.t); if (d !== lastDay) { h += '<div class="waDay"><span>' + d + '</span></div>'; lastDay = d; prev = null; }
+      const mine = m.f === ME.id, first = !prev || prev.f !== m.f;
+      const showAv = c.group && !mine;
+      h += '<div class="waRow' + (mine ? ' me' : '') + (first ? ' first' : '') + '">' + (showAv ? (first ? avatar(LOOKS[m.f], 30, 'margin-top:2px') : '<span style="width:30px;flex:none"></span>') : '');
+      if (m.k === 'orbi') h += '<div class="waStick">' + (first && c.group && !mine ? '<b class="waName" style="color:' + nameCol(m.f) + '">' + esc(m.n) + '</b>' : '') + '<svg viewBox="0 0 300 420">' + (O.orbiSVG ? O.orbiSVG(m.l || LOOKS[m.f], { noScene: true }) : '') + '</svg><small>' + hhmm(m.t) + (mine ? ' ' + tick(m, c) : '') + '</small></div>';
+      else h += '<div class="waB">' + (first && c.group && !mine ? '<b class="waName" style="color:' + nameCol(m.f) + '">' + esc(m.n) + '</b>' : '') + '<span class="waTxt">' + linkify(clean(m.x)) + '</span><small>' + hhmm(m.t) + (mine ? ' ' + tick(m, c) : '') + '</small></div>';
+      h += '</div>'; prev = m;
+    });
+    el.innerHTML = h;
+    if (atEnd || L.length && L[L.length - 1].f === ME.id) el.scrollTop = el.scrollHeight;
+  }
+  const nameCol = id => ['#e542a3', '#1f7aec', '#d3742b', '#029d00', '#a62ce1', '#00a5f4', '#c4532d'][[...id].reduce((a, ch) => a + ch.charCodeAt(0), 0) % 7];
+
+  /* ---------- ventanitas ---------- */
+  function modal(html, wire) {
+    const w = document.createElement('div'); w.className = 'waModal'; w.innerHTML = '<div class="waBox">' + html + '</div>';
+    document.body.appendChild(w); const close = () => w.remove();
+    w.addEventListener('click', e => { if (e.target === w) close(); });
+    wire(w.querySelector('.waBox'), close); return close;
+  }
+  function profile(first) {
+    const L = myLook();
+    const html = '<div class="waProf">' + avatar(L, 130) + '<div style="flex:1;min-width:200px"><h3>' + (first ? 'Armá tu perfil para chatear' : 'Tu perfil') + '</h3>' +
+      '<p class="waMut">Tu foto de perfil es tu Orbi, vestido como lo diseñaste en «Vestí a Orbi».</p><button class="btn alt" id="pDress" type="button" style="color:#fff">👕 Cambiar mi Orbi</button></div></div>' +
+      '<label>Tu nombre</label><input id="pN" maxlength="30" placeholder="Ej.: Tobías o Profe Laura" value="' + esc(ME.name) + '">' +
+      '<label>Info</label><input id="pS" maxlength="60" value="' + esc(ME.st) + '">' +
+      '<label class="waChk"><input type="checkbox" id="pE"' + (ME.escuela ? ' checked' : '') + '> Modo escuela (tapa malas palabras)</label>' +
+      '<div class="waBtns"><button class="btn" id="pOk" type="button">Guardar</button>' + (first ? '' : '<button class="btn alt" id="pX" type="button" style="color:#fff">Cerrar</button>') + '</div>';
+    if (first && root) { root.innerHTML = '<div class="waFirst"><div class="waBox">' + html + '</div></div>'; wire(root.querySelector('.waBox'), () => {}); return; }
+    modal(html, wire);
+    function wire(b, close) {
+      b.querySelector('#pDress').onclick = () => { close(); O.openGame && O.openGame('vestir'); };
+      const x = b.querySelector('#pX'); if (x) x.onclick = close;
+      b.querySelector('#pOk').onclick = () => {
+        const n = b.querySelector('#pN').value.trim(); if (!n) { b.querySelector('#pN').focus(); b.querySelector('#pN').placeholder = 'Poné tu nombre'; return; }
+        ME.name = n.slice(0, 30); ME.st = b.querySelector('#pS').value.trim().slice(0, 60); ME.escuela = b.querySelector('#pE').checked; O.store.set('chat.me', ME);
+        close(); Object.keys(CONN).forEach(presence); render();
+      };
+    }
+  }
+  function newChat() {
+    modal('<h3>Nuevo chat</h3><div class="waTabs"><button class="on" data-t="crear" type="button">Crear</button><button data-t="unir" type="button">Tengo un código</button></div>' +
+      '<div data-p="crear"><label>Nombre del chat</label><input id="nN" maxlength="40" placeholder="Ej.: 6°B Matemática o Chat con Juan"><label class="waChk"><input type="checkbox" id="nG" checked> Es un grupo (varios participantes)</label><div class="waBtns"><button class="btn" id="nOk" type="button">Crear chat</button></div></div>' +
+      '<div data-p="unir" hidden><label>Código del chat</label><input id="jC" maxlength="8" placeholder="Ej.: K7QM2X" style="text-transform:uppercase;font-size:22px;letter-spacing:.12em"><div class="waBtns"><button class="btn" id="jOk" type="button">Entrar</button></div></div>' +
+      '<p class="waMut" style="margin-top:12px">Solo entra quien tenga el código. Los chats se guardan en este aparato.</p>', (b, close) => {
+      b.querySelectorAll('[data-t]').forEach(t => t.onclick = () => { b.querySelectorAll('[data-t]').forEach(x => x.classList.toggle('on', x === t)); b.querySelectorAll('[data-p]').forEach(p => p.hidden = p.dataset.p !== t.dataset.t); });
+      b.querySelector('#nOk').onclick = () => { const n = b.querySelector('#nN').value.trim() || 'Chat nuevo'; const code = rid(6); LIST.unshift({ code, name: n.slice(0, 40), group: b.querySelector('#nG').checked, created: now(), last: now(), members: {} }); saveList(); close(); openChat(code); invite(chatOf(code)); };
+      b.querySelector('#jOk').onclick = () => { const c = b.querySelector('#jC').value.toUpperCase().replace(/[^A-Z0-9]/g, ''); if (c.length < 4) { b.querySelector('#jC').focus(); return; } close(); joinCode(c); };
+      setTimeout(() => b.querySelector('#nN').focus(), 50);
+    });
+  }
+  function joinCode(code) {
+    code = String(code).toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 8); if (code.length < 4) return;
+    if (!chatOf(code)) { LIST.unshift({ code, name: 'Chat ' + code, group: true, created: now(), last: now(), members: {} }); saveList(); }
+    openChat(code);
+  }
+  function invite(c) {
+    const link = location.origin + location.pathname + '#chat=' + c.code;
+    const txt = 'Sumate a mi chat «' + c.name + '» en Órbita. Código: ' + c.code + '\n' + link;
+    modal('<h3>Invitar al chat</h3><p class="waMut">Pasales este código. Lo ponen en Chat → ✚ → Tengo un código.</p><div class="waCode">' + c.code + '</div><div class="waBtns"><button class="btn" id="iCp" type="button">Copiar invitación</button>' + (navigator.share ? '<button class="btn alt" id="iSh" type="button" style="color:#fff">Compartir</button>' : '') + '<button class="btn alt" id="iX" type="button" style="color:#fff">Listo</button></div>', (b, close) => {
+      b.querySelector('#iCp').onclick = () => { navigator.clipboard && navigator.clipboard.writeText(txt).then(() => { b.querySelector('#iCp').textContent = '¡Copiada!'; }, () => {}); };
+      const sh = b.querySelector('#iSh'); if (sh) sh.onclick = () => navigator.share({ title: 'Chat de Órbita', text: txt }).catch(() => {});
+      b.querySelector('#iX').onclick = close;
+    });
+  }
+  function info(c) {
+    const k = CONN[c.code]; const online = new Set((k ? k.peers : []).filter(p => !p.sameTab && p.presence).map(p => p.presence.id));
+    const mem = Object.keys(c.members || {}).filter(id => id !== ME.id);
+    modal('<div style="text-align:center">' + groupAv(c, 90) + '<h3 style="margin:10px 0 2px">' + esc(c.name) + '</h3><p class="waMut">Código ' + c.code + ' · ' + (mem.length + 1) + ' participantes</p></div>' +
+      '<label>Nombre del chat (en este aparato)</label><input id="cN" maxlength="40" value="' + esc(c.name) + '">' +
+      '<div class="waMem"><div>' + avatar(myLook(), 40) + '<span><b>' + esc(ME.name) + ' (vos)</b><small>' + esc(ME.st) + '</small></span></div>' + mem.map(id => '<div>' + avatar(LOOKS[id], 40) + '<span><b>' + esc(c.members[id]) + '</b><small>' + (online.has(id) ? '🟢 en línea' : 'no conectado') + '</small></span></div>').join('') + '</div>' +
+      '<div class="waBtns"><button class="btn" id="cOk" type="button">Guardar</button><button class="btn alt" id="cInv" type="button" style="color:#fff">Invitar</button><button class="btn cor" id="cDel" type="button">Salir y borrar</button></div>', (b, close) => {
+      b.querySelector('#cOk').onclick = () => { c.name = b.querySelector('#cN').value.trim().slice(0, 40) || c.name; saveList(); close(); paintList(); paintMain(); };
+      b.querySelector('#cInv').onclick = () => { close(); invite(c); };
+      let armed = false;
+      b.querySelector('#cDel').onclick = () => {
+        const d = b.querySelector('#cDel'); if (!armed) { armed = true; d.textContent = 'Tocá otra vez para borrar'; return; }
+        const k = CONN[c.code]; if (k) { k.unsubs.forEach(u => { try { u(); } catch (e) {} }); try { k.R && k.R.leave(); } catch (e) {} delete CONN[c.code]; }
+        LIST = LIST.filter(x => x !== c); saveList(); try { localStorage.removeItem('orb.chat.m.' + c.code); } catch (e) {} delete MSGS[c.code];
+        cur = null; pane = 'list'; close(); render(); badge();
+      };
+    });
+  }
+
+  /* links de invitación: #chat=CODIGO */
+  let pendingJoin = null;
+  const mj = /^#chat=([A-Za-z0-9]{4,8})$/.exec(location.hash);
+  if (mj) { pendingJoin = mj[1]; history.replaceState(null, '', location.pathname + location.search + '#chat'); }
+  addEventListener('hashchange', () => { const m = /^#chat=([A-Za-z0-9]{4,8})$/.exec(location.hash); if (m) { pendingJoin = m[1]; location.hash = 'chat'; } });
+  document.addEventListener('visibilitychange', () => { if (cur && viewOn()) { const c = chatOf(cur); if (c && c.unread) { c.unread = 0; saveList(); badge(); paintList(); } seen(cur); } });
+  /* que los chats reciban mensajes aunque estés en otra parte de Órbita */
+  setTimeout(() => { if (ME.name) LIST.slice(0, 10).forEach(c => connect(c.code)); badge(); }, 2500);
+
+  const css = document.createElement('style');
+  css.textContent = `
+  #v-chat{padding:0}
+  #chatRoot{height:calc(100dvh - var(--waTop,64px));min-height:420px;background:#0c1317}
+  .waAv{display:inline-block;border-radius:50%;overflow:hidden;flex:none;background:#dfe5e7;vertical-align:middle}
+  .waAv svg{width:100%;height:100%;display:block}
+  .wa{display:grid;grid-template-columns:minmax(280px,30%) 1fr;height:100%;color:#111b21;font-family:Nunito,system-ui,sans-serif}
+  .waSide{display:flex;flex-direction:column;background:#fff;border-right:1px solid #d1d7db;min-height:0}
+  .waTop,.waHead{display:flex;align-items:center;gap:10px;padding:10px 14px;background:#f0f2f5;min-height:60px}
+  .waMe,.waHInfo{display:flex;align-items:center;gap:10px;border:0;background:none;padding:0;text-align:left;color:inherit;min-width:0}
+  .waTitle{flex:1;font:700 20px Fredoka,sans-serif;color:#111b21}
+  .waIco{width:40px;height:40px;border:0;border-radius:50%;background:none;color:#54656f;display:inline-flex;align-items:center;justify-content:center;flex:none}
+  .waIco:hover{background:rgba(0,0,0,.06)}.waIco svg{width:24px;height:24px}
+  .waSearch{padding:8px 12px;border-bottom:1px solid #e9edef}
+  .waSearch input{width:100%;border:0;background:#f0f2f5;border-radius:10px;padding:9px 14px;font-size:15px;color:#111b21}
+  .waList{overflow-y:auto;flex:1}
+  .waItem{display:flex;gap:12px;align-items:center;width:100%;border:0;background:#fff;padding:9px 14px;text-align:left;color:inherit}
+  .waItem:hover{background:#f5f6f6}.waItem.on{background:#f0f2f5}
+  .waTx{flex:1;min-width:0;border-bottom:1px solid #e9edef;padding-bottom:9px}
+  .waL1,.waL2{display:flex;justify-content:space-between;align-items:center;gap:8px}
+  .waL1 b{font-weight:700;font-size:16px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .waL1 small{color:#667781;font-size:12px;flex:none}.waL1 small.un{color:#1fa855;font-weight:800}
+  .waPrev{color:#667781;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:flex;align-items:center;gap:3px}
+  .waUn{background:#25d366;color:#fff;border-radius:999px;min-width:20px;height:20px;padding:0 6px;font-size:12px;font-weight:800;display:inline-flex;align-items:center;justify-content:center;flex:none}
+  .waTyping{color:#1fa855;font-style:normal}
+  .waEmpty{padding:30px 20px;text-align:center;color:#667781}
+  .waMain{display:flex;flex-direction:column;min-height:0;background:#efeae2 url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120' viewBox='0 0 120 120'%3E%3Cg fill='none' stroke='%23d9d2c5' stroke-width='2'%3E%3Ccircle cx='20' cy='22' r='7'/%3E%3Cellipse cx='20' cy='22' rx='13' ry='4' transform='rotate(-20 20 22)'/%3E%3Cpath d='M78 18l4 8 9 1-7 6 2 9-8-5-8 5 2-9-7-6 9-1z'/%3E%3Cpath d='M30 84q8-10 16 0t16 0'/%3E%3Ccircle cx='96' cy='88' r='4'/%3E%3Cpath d='M62 54h14M69 47v14'/%3E%3C/g%3E%3C/svg%3E")}
+  .waHello{margin:auto;text-align:center;max-width:460px;padding:30px;color:#41525d}
+  .waHello h2{font:600 30px Fredoka,sans-serif;color:#41525d;margin:14px 0 6px}
+  .waLock{font-size:14px;color:#667781;margin-top:18px}
+  .waHead{border-left:1px solid #d1d7db}
+  .waHInfo{flex:1;cursor:pointer}.waHInfo span{display:flex;flex-direction:column;min-width:0}
+  .waHInfo b{font-size:16px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.waHInfo small{color:#667781;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .waBack{display:none}
+  .waMsgs{flex:1;overflow-y:auto;padding:10px 6% 14px;display:flex;flex-direction:column;gap:2px}
+  .waNote{align-self:center;max-width:520px;background:#ffeecd;color:#54656f;font-size:12.5px;text-align:center;border-radius:8px;padding:6px 12px;margin:6px 0 10px;box-shadow:0 1px .5px rgba(11,20,26,.13)}
+  .waDay{align-self:center;margin:8px 0}.waDay span{background:#fff;color:#54656f;font-size:12.5px;border-radius:8px;padding:5px 12px;box-shadow:0 1px .5px rgba(11,20,26,.13)}
+  .waRow{display:flex;gap:6px;align-items:flex-start}.waRow.first{margin-top:6px}.waRow.me{justify-content:flex-end}
+  .waB{position:relative;max-width:min(65%,560px);background:#fff;border-radius:8px;padding:6px 8px 6px 9px;box-shadow:0 1px .5px rgba(11,20,26,.13);font-size:15px;line-height:1.38;word-wrap:break-word;overflow-wrap:anywhere}
+  .waRow.me .waB{background:#d9fdd3}
+  .waRow.first:not(.me) .waB{border-top-left-radius:0}.waRow.first.me .waB{border-top-right-radius:0}
+  .waName{display:block;font-size:13px;margin-bottom:1px}
+  .waTxt{white-space:pre-wrap}
+  .waB small,.waStick small{float:right;margin:6px 0 -4px 10px;color:#667781;font-size:11px;display:inline-flex;align-items:center;gap:3px;position:relative;top:4px}
+  .waTk{display:inline-flex;color:#8696a0}.waTk svg{width:16px;height:11px}.waTk.blue{color:#53bdeb}
+  .waStick{max-width:170px}.waStick>svg{width:150px;height:auto;display:block;filter:drop-shadow(0 3px 4px rgba(0,0,0,.2))}
+  .waStick small{float:none;background:rgba(255,255,255,.85);border-radius:8px;padding:1px 6px;top:0;margin:0}
+  .waBar{display:flex;align-items:flex-end;gap:8px;padding:8px 12px;background:#f0f2f5}
+  .waBar textarea{flex:1;resize:none;border:0;border-radius:10px;padding:10px 14px;font:15px Nunito,sans-serif;color:#111b21;background:#fff;max-height:120px;line-height:1.35}
+  .waSend{width:44px;height:44px;border:0;border-radius:50%;background:#00a884;color:#fff;display:inline-flex;align-items:center;justify-content:center;flex:none}.waSend svg{width:22px;height:22px}
+  .waEmo{display:flex;flex-wrap:wrap;gap:2px;padding:8px 12px;background:#f0f2f5;border-top:1px solid #e9edef;max-height:150px;overflow:auto}
+  .waEmo[hidden]{display:none}
+  body:has(#v-chat.on) .orbiFab{display:none}
+  .waEmo button{border:0;background:none;font-size:24px;width:42px;height:42px;border-radius:8px}.waEmo button:hover{background:#e2e6e9}
+  .waEmo .waStk{width:auto;font-size:14px;font-weight:800;display:inline-flex;align-items:center;gap:6px;padding:0 10px;background:#fff;color:#111b21}
+  .waModal{position:fixed;inset:0;z-index:300;background:rgba(11,20,26,.55);display:flex;align-items:center;justify-content:center;padding:14px}
+  .waBox{width:min(480px,100%);max-height:92vh;overflow:auto;background:#fff;color:#111b21;border-radius:16px;padding:20px 22px;font-family:Nunito,sans-serif;box-shadow:0 10px 40px rgba(0,0,0,.3)}
+  .waBox h3{font:600 22px Fredoka,sans-serif;margin:0 0 6px;color:#111b21}
+  .waBox label{display:block;font-weight:800;margin:12px 0 4px;color:#3b4a54}
+  .waBox input:not([type=checkbox]){width:100%;border:2px solid #d1d7db;border-radius:10px;padding:10px 12px;font-size:16px;color:#111b21;background:#fff}
+  .waBox .waChk{display:flex;align-items:center;gap:8px;font-weight:600}
+  .waMut{color:#667781;margin:4px 0 8px}
+  .waBtns{display:flex;flex-wrap:wrap;gap:8px;margin-top:16px}
+  .waProf{display:flex;gap:18px;align-items:center;flex-wrap:wrap}
+  .waTabs{display:flex;gap:6px;margin:6px 0 4px}.waTabs button{flex:1;border:0;border-radius:10px;padding:9px;background:#f0f2f5;font-weight:800;color:#54656f}.waTabs button.on{background:#d9fdd3;color:#008069}
+  .waCode{font:700 44px Fredoka,monospace;letter-spacing:.14em;text-align:center;background:#f0f2f5;border-radius:12px;padding:10px;margin:10px 0;color:#008069}
+  .waMem{margin-top:12px;display:flex;flex-direction:column;gap:8px}.waMem>div{display:flex;gap:10px;align-items:center}.waMem span{display:flex;flex-direction:column}.waMem small{color:#667781}
+  .waFirst{height:100%;display:flex;align-items:center;justify-content:center;padding:16px;background:#efeae2}
+  .waBadge{display:inline-flex;align-items:center;justify-content:center;min-width:19px;height:19px;margin-left:6px;padding:0 5px;border-radius:999px;background:#25d366;color:#fff;font-size:11px}
+  @media (max-width:760px){
+    .wa{grid-template-columns:1fr}
+    .wa[data-pane=list] .waMain{display:none}.wa[data-pane=chat] .waSide{display:none}
+    .waBack{display:inline-flex}.waMsgs{padding:8px 10px}
+  }`;
+  document.head.appendChild(css);
+  const setTop = () => { const t = document.querySelector('.top'); if (t) document.documentElement.style.setProperty('--waTop', t.offsetHeight + 'px'); };
+  addEventListener('resize', setTop); setTimeout(setTop, 300);
+
+  O.chat = { render: () => { setTop(); render(); } };
+})();
+
+</script>
 <script>/* app.js */
 /* Órbita: navegación, inicio, buscador, IA, listas de juegos */
 {
@@ -8966,6 +9418,7 @@ window.ORB = (function () {
   const SECTIONS = [
     { id: 'buscar', title: 'Buscador', desc: 'Busca en juegos, lecciones y un diccionario de 5 idiomas, con respuesta rápida de la IA.', col: '#4fc3f7', icon: '<circle cx="-4" cy="-4" r="11" fill="none" stroke="#0b3034" stroke-width="5"/><path d="M4 4l10 10" stroke="#0b3034" stroke-width="6" stroke-linecap="round"/>' },
     { id: 'ia', title: 'IA', desc: 'Preguntale lo que quieras: tareas, curiosidades, ideas. También te abre los juegos.', col: '#ffd23f', icon: '<path d="M-15-12h30a5 5 0 0 1 5 5v13a5 5 0 0 1-5 5H-2l-9 8v-8h-4a5 5 0 0 1-5-5v-13a5 5 0 0 1 5-5z" fill="#0b3034"/><circle cx="-7" cy="-1" r="2.6" fill="#ffd23f"/><circle cx="0" cy="-1" r="2.6" fill="#ffd23f"/><circle cx="7" cy="-1" r="2.6" fill="#ffd23f"/>' },
+    { id: 'chat', orbit: false, title: 'Chat', desc: 'Chateá con tu curso, tus alumnos o tus amigos, estilo WhatsApp. Tu foto de perfil es tu Orbi vestido.', col: '#25d366', icon: '<path d="M0-18a18 18 0 0 0-15.6 27L-18 18l9.3-2.4A18 18 0 1 0 0-18z" fill="#0b3034"/><path d="M-7-6q2-3 4 0l1 3-2 2q3 6 8 8l2-2 3 1q3 2 0 4-4 3-10-1t-7-11q0-2 1-4z" fill="#25d366"/>' },
     { id: 'estudio', title: 'Estudio', desc: 'Libros y exámenes con IA para la clase, clase en vivo, corrector, cuaderno, canciones e ideas.', col: '#ff9600', icon: '<rect x="-16" y="-18" width="32" height="36" rx="4" fill="#0b3034"/><path d="M-9-8h18M-9 0h18M-9 8h12" stroke="#ff9600" stroke-width="3"/>' },
     { id: 'bienestar', title: 'Bienestar', desc: 'Contá cómo te sentís, respirá con calma y encontrá dónde pedir ayuda. Orbi te escucha.', col: '#ff86a8', orbit: false, icon: '<path d="M0 16C-20 2-22-10-14-16c6-4 12-2 14 4 2-6 8-8 14-4 8 6 6 18-14 32z" fill="#0b3034"/>' },
     { id: 'educativos', title: 'Educativos', desc: 'Matemática, lengua, geografía, ciencias, historia y programación jugando. Y quiz de cualquier tema con IA.', col: '#00bfa6', icon: '<path d="M-20-4L0-14 20-4 0 6z" fill="#0b3034"/><path d="M-12 0v9q12 8 24 0V0L0 6z" fill="#0b3034"/><path d="M17-3v12" stroke="#0b3034" stroke-width="3"/>' },
@@ -8976,12 +9429,13 @@ window.ORB = (function () {
   ];
 
   /* ---------- navegación ---------- */
-  const VIEWS = ['inicio', 'buscar', 'ia', 'estudio', 'bienestar', 'educativos', 'accesibles', 'ninos', 'juegos', 'idiomas'];
+  const VIEWS = ['inicio', 'buscar', 'ia', 'chat', 'estudio', 'bienestar', 'educativos', 'accesibles', 'ninos', 'juegos', 'idiomas'];
   function route() {
     let v = (location.hash || '#inicio').slice(1); if (!VIEWS.includes(v)) v = 'inicio';
     VIEWS.forEach(x => $('#v-' + x).classList.toggle('on', x === v));
     document.querySelectorAll('#nav a').forEach(a => { if (a.getAttribute('href') === '#' + v) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current'); });
     if (v === 'idiomas') O.lingo.render();
+    if (v === 'chat' && O.chat) O.chat.render();
     if (v === 'bienestar') O.bienestar.render();
     if (v === 'buscar' && O.searchShow) O.searchShow();
     if (v === 'ia') setTimeout(() => $('#iaIn').focus(), 50);
@@ -9090,7 +9544,7 @@ window.ORB = (function () {
   let busy = false, chatCtrl = null;
   const TOOLS = [
     { name: 'abrir_juego', description: 'Abre un juego de Órbita en pantalla completa. Algunos ids: costa3d (Costa Neón 3D, estilo GTA), frente (Frente Cero, estilo Call of Duty), puertas (Las 100 Puertas), umbra (terror), golazo (fútbol), impostor, cubos (bloques), primera (Fútbol de Primera), quien, ajedrez, damas, cuatro, tateti, naval, escaleras, sopa, laberinto, cordones, colorear, xilofon, memotest, tablas, fracciones, reloj, robot, braille.', inputSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] }, execute(i) { const ok = !!(O.kids.concat(O.big, O.edu, O.acc).find(g => g.id === i.id)); if (ok) setTimeout(() => openGame(i.id), 900); return ok ? { abierto: i.id } : { error: 'No existe ese juego' }; } },
-    { name: 'abrir_seccion', description: 'Lleva al usuario a una sección de Órbita.', inputSchema: { type: 'object', properties: { seccion: { type: 'string', enum: ['inicio', 'buscar', 'ia', 'estudio', 'bienestar', 'educativos', 'accesibles', 'ninos', 'juegos', 'idiomas'] } }, required: ['seccion'] }, execute(i) { setTimeout(() => go(i.seccion), 900); return { abierta: i.seccion }; } }
+    { name: 'abrir_seccion', description: 'Lleva al usuario a una sección de Órbita.', inputSchema: { type: 'object', properties: { seccion: { type: 'string', enum: ['inicio', 'buscar', 'ia', 'chat', 'estudio', 'bienestar', 'educativos', 'accesibles', 'ninos', 'juegos', 'idiomas'] } }, required: ['seccion'] }, execute(i) { setTimeout(() => go(i.seccion), 900); return { abierta: i.seccion }; } }
   ];
   async function sendChat(text) {
     text = (text || '').trim(); if (!text || busy) return;
